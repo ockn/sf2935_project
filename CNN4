@@ -1,0 +1,458 @@
+#KTH SF2935
+#Name: Cecil Knudsen
+#CNN for Vehicle re-id 
+
+import json, time, random
+from pathlib import Path
+from typing import List, Tuple, Dict
+import numpy as np
+from PIL import Image
+from tqdm.auto import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.preprocessing import normalize
+from sklearn.calibration import calibration_curve
+import matplotlib.pyplot as plt
+
+
+# CONFIG 
+CONFIG = {
+    "DATA_ROOT": r"C:\Users\cecil\Documents\dataset\archive\VeRi",
+    "IMG_SIZE":  [128, 128],  #(H, W)
+    "SEED": 42,
+    "OUT_DIR": "outputs",
+    "USE_CAMERA_HOLDOUT": False,
+    "HOLDOUT_CAM": "c002",
+
+    # Bootstrap
+    "BOOT_N": 1000,
+    "CI": 95,   # 95% CI
+
+    # CNN Settings
+    "EMB_DIM": 128,
+    "BATCH_SIZE": 128,
+    "EPOCHS": 10,
+    "LR": 1e-3,
+    "WEIGHT_DECAY": 5e-4,
+    "AMP": False,  # AMP only on CUDA;
+}
+
+OUT_JSON = "veri_cnn_results.json"
+SAVE_CKPT = "veri_tinycnn.pth"
+USE_RGB = True
+
+
+#helpers
+def set_seed(seed: int):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def ensure_outdir(path: str | Path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def timestamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def save_json(path: str | Path, obj: dict):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+def list_images(folder: Path) -> List[Path]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp"}
+    return [p for p in folder.iterdir() if p.suffix.lower() in exts]
+
+def parse_vid_from_filename(path: str) -> str:
+    return Path(path).stem.split("_")[0]
+
+def parse_cam_from_filename(path: str) -> str:
+    toks = Path(path).stem.split("_")
+    return toks[1] if len(toks) > 1 else "c000"
+
+def camera_split_train(paths: List[Path], holdout_cam: str) -> Tuple[List[Path], List[Path]]:
+    tr, va = [], []
+    for p in paths:
+        cam = parse_cam_from_filename(str(p))
+        (va if cam == holdout_cam else tr).append(p)
+    return tr, va
+
+def read_list_txt(path: Path) -> List[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+def load_veri_eval_lists(root: Path):
+    q_names = read_list_txt(root / "name_query.txt")
+    g_names = read_list_txt(root / "name_test.txt")
+    gt_map, jk_map = {}, {}
+    for i, line in enumerate(read_list_txt(root / "gt_index.txt")):
+        if not line: gt_map[i] = set(); continue
+        idxs = [int(tok) - 1 for tok in line.split()]
+        gt_map[i] = {g_names[j] for j in idxs if 0 <= j < len(g_names)}
+    for i, line in enumerate(read_list_txt(root / "jk_index.txt")):
+        if not line: jk_map[i] = set(); continue
+        idxs = [int(tok) - 1 for tok in line.split()]
+        jk_map[i] = {g_names[j] for j in idxs if 0 <= j < len(g_names)}
+    return q_names, g_names, gt_map, jk_map
+
+
+# Evaluation
+def eval_veri(q_emb, q_names, g_emb, g_names, gt_map, jk_map, topk=(1,5,10)):
+    """
+    Returns:
+      metrics (means),
+      ap_per_q (Q,),
+      cmc_ind (Q x K)  binary (1 if first correct within k),
+      prec_at_k (Q x K) in [0,1],
+      order (Q x G indices) for qualitative strips if needed
+    """
+    Q = normalize(q_emb, axis=1)
+    G = normalize(g_emb, axis=1)
+    sims = Q @ G.T
+    order = np.argsort(-sims, axis=1)  # sort by similarity desc
+
+    K = len(topk)
+    ap_per_q   = np.zeros(Q.shape[0], dtype=np.float64)
+    cmc_ind    = np.zeros((Q.shape[0], K), dtype=np.float64)
+    prec_at_k  = np.zeros((Q.shape[0], K), dtype=np.float64)
+
+    for qi in tqdm(range(Q.shape[0]), desc="eval: VeRi (AP/CMC/Precision)", unit="q"):
+        ranked = order[qi]
+        gt_set   = gt_map.get(qi, set())
+        junk_set = jk_map.get(qi, set())
+
+        good = np.array([g_names[j] in gt_set   for j in ranked], dtype=bool)
+        junk = np.array([g_names[j] in junk_set for j in ranked], dtype=bool)
+        keep = ~junk
+        good_kept = good[keep]  # boolean vector aligned to kept ranks
+
+        # CMC indicator (first correct within k)
+        if good_kept.any():
+            first_pos = int(np.argmax(good_kept))
+            for kidx, k in enumerate(topk):
+                cmc_ind[qi, kidx] = 1.0 if first_pos < k else 0.0
+
+        # AP
+        if good_kept.sum() == 0:
+            ap_per_q[qi] = 0.0
+        else:
+            hits, precisions = 0, []
+            for r, is_good in enumerate(good_kept, start=1):
+                if is_good:
+                    hits += 1
+                    precisions.append(hits / r)
+            ap_per_q[qi] = float(np.mean(precisions))
+
+        # Precision@k 
+        for kidx, k in enumerate(topk):
+            topk_slice = good_kept[:k]
+            prec_at_k[qi, kidx] = float(topk_slice.mean()) if topk_slice.size else 0.0
+
+    metrics = {
+        "mAP": float(ap_per_q.mean()),
+        **{f"CMC@{k}": float(cmc_ind[:, i].mean()) for i, k in enumerate(topk)},
+        **{f"Precision@{k}": float(prec_at_k[:, i].mean()) for i, k in enumerate(topk)},
+        **{f"FP@{k}": float(1.0 - prec_at_k[:, i].mean()) for i, k in enumerate(topk)},
+        "Correct@1": float(cmc_ind[:, 0].mean()),
+        "FP@1_overall": float(1.0 - cmc_ind[:, 0].mean()),
+    }
+    return metrics, ap_per_q, cmc_ind, prec_at_k, order
+
+def bootstrap(ap_per_q: np.ndarray,
+                       cmc_ind: np.ndarray,
+                       prec_at_k: np.ndarray,
+                       n_boot: int,
+                       alpha: float,
+                       seed: int,
+                       topk=(1,5,10)):
+    """
+    Query-level bootstrap CIs for:
+      - mAP
+      - CMC@k
+      - Precision@k and FP@k = 1 - Precision@k
+    """
+    rng = np.random.default_rng(seed)
+    Q = ap_per_q.shape[0]
+    K = cmc_ind.shape[1]
+    stats = np.empty((n_boot, 1 + K + K), dtype=np.float64)  # [mAP, Ck..., Pk...]
+
+    for _ in tqdm(range(n_boot), desc="Bootstrapping CIs", unit="boot", leave=False):
+        idx = rng.integers(0, Q, size=Q)
+        stats[_, 0]        = ap_per_q[idx].mean()
+        stats[_, 1:1+K]    = cmc_ind[idx].mean(axis=0)
+        stats[_, 1+K:1+K+K]= prec_at_k[idx].mean(axis=0)
+
+    lo = np.percentile(stats, 100*alpha/2, axis=0)
+    hi = np.percentile(stats, 100*(1 - alpha/2), axis=0)
+
+    ci = {"mAP_CI95": [float(lo[0]), float(hi[0])]}
+    for i, k in enumerate(topk):
+        ci[f"CMC@{k}_CI95"] = [float(lo[1+i]), float(hi[1+i])]
+    for i, k in enumerate(topk):
+        ci[f"Precision@{k}_CI95"] = [float(lo[1+K+i]), float(hi[1+K+i])]
+        # FP interval is 1 - precision interval (reverse ends)
+        lo_p, hi_p = lo[1+K+i], hi[1+K+i]
+        ci[f"FP@{k}_CI95"] = [float(1.0 - hi_p), float(1.0 - lo_p)]
+    return ci
+
+def plot_learning_curves(history: dict, out_path: Path):
+    if not history: return
+    plt.figure()
+    if "train_loss" in history: plt.plot(history["train_loss"], label="Train Loss")
+    if "val_acc" in history:    plt.plot(history["val_acc"], label="Val Accuracy")
+    plt.xlabel("Epoch"); plt.ylabel("Loss / Accuracy")
+    plt.title("Learning Curves (CNN)"); plt.legend(); plt.tight_layout()
+    plt.savefig(out_path, dpi=200); plt.close()
+
+def plot_reliability(confs, correct, out_path: Path, title="Calibration"):
+    prob_true, prob_pred = calibration_curve(correct, confs, n_bins=10, strategy="uniform")
+    plt.figure()
+    plt.plot([0,1],[0,1],"--",linewidth=1)
+    plt.plot(prob_pred, prob_true, marker="o")
+    plt.xlabel("Predicted confidence"); plt.ylabel("Empirical accuracy")
+    plt.title(title); plt.tight_layout()
+    plt.savefig(out_path, dpi=200); plt.close()
+
+
+# Dataset / Model
+
+class VeRiDataset(Dataset):
+    def __init__(self, items, size=(128,128), use_rgb=True, map_ids=None, augment=False):
+        self.items = items
+        self.size = size
+        self.use_rgb = use_rgb
+        self.augment = augment
+        vids = sorted({vid for _, vid in items}) if map_ids is None else sorted(list(map_ids))
+        self.vid2idx = {v:i for i,v in enumerate(vids)}
+        self.rng = random.Random(42)
+
+    def __len__(self): return len(self.items)
+
+    def __getitem__(self, idx):
+        p, vid = self.items[idx]
+        img = Image.open(p).convert("RGB" if self.use_rgb else "L").resize(self.size, Image.BILINEAR)
+        if self.augment and self.rng.random() < 0.5:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        if not self.use_rgb: arr = arr[..., None]
+        arr = np.transpose(arr, (2,0,1))
+        for c in range(arr.shape[0]):
+            m = arr[c].mean(); s = arr[c].std() + 1e-6; arr[c] = (arr[c]-m)/s
+        x = torch.from_numpy(arr).float()
+        y = self.vid2idx.get(vid, -1)
+        return x, torch.tensor(y).long(), Path(p).name, vid
+
+def build_items(paths: List[Path], max_per_id=None):
+    by_id: Dict[str, List[str]] = {}
+    for p in paths:
+        vid = parse_vid_from_filename(str(p))
+        by_id.setdefault(vid, []).append(str(p))
+    items: List[Tuple[str, str]] = []
+    for vid, lst in by_id.items():
+        if max_per_id is not None: lst = lst[:max_per_id]
+        items.extend((p, vid) for p in lst)
+    return items
+
+def split_train_val_by_images_per_id(items: List[Tuple[str,str]], val_frac=0.1, seed=42):
+    rng = random.Random(seed)
+    by_id: Dict[str, List[str]] = {}
+    for p, vid in items: by_id.setdefault(vid, []).append(p)
+    tr, va = [], []
+    for vid, lst in by_id.items():
+        lst = list(lst); rng.shuffle(lst)
+        n_val = max(1, int(len(lst)*val_frac))
+        va.extend((p, vid) for p in lst[:n_val])
+        tr.extend((p, vid) for p in lst[n_val:])
+    return tr, va
+
+class TinyCNN(nn.Module):
+    def __init__(self, in_ch=3, emb_dim=128, n_classes=1000):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_ch, 32, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(64,128,3, stride=2, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1,1))
+        )
+        self.emb = nn.Linear(128, emb_dim)
+        self.bn  = nn.BatchNorm1d(emb_dim)
+        self.act = nn.ReLU(inplace=True)
+        self.cls = nn.Linear(emb_dim, n_classes)
+
+    def forward(self, x, return_emb=False):
+        f = self.features(x).flatten(1)
+        e = self.emb(f)
+        if return_emb:
+            return nn.functional.normalize(e, dim=1)
+        e = self.bn(e); e = self.act(e)
+        return self.cls(e)
+
+@torch.no_grad()
+def embed_loader(model, loader, device):
+    model.eval()
+    embs, vids, names = [], [], []
+    for x, y, name, vid in tqdm(loader, desc="embed", unit="batch"):
+        x = x.to(device, non_blocking=True)
+        e = model(x, return_emb=True).cpu().numpy()
+        embs.append(e); vids.extend(list(vid)); names.extend(list(name))
+    return np.vstack(embs), np.array(vids), names
+
+
+# Qualitative
+def save_strip(out_path: Path, q_dir: Path, g_dir: Path,
+               q_name: str, ranked_g_names: List[str], k: int = 5):
+    q_img = Image.open(q_dir / q_name).convert("RGB").resize((128,128), Image.BILINEAR)
+    tiles = [q_img]
+    for j in ranked_g_names[:k]:
+        tiles.append(Image.open(g_dir / j).convert("RGB").resize((128,128), Image.BILINEAR))
+    w = 128 * len(tiles); h = 128
+    canvas = Image.new("RGB", (w, h), (255,255,255))
+    x = 0
+    for t in tiles:
+        canvas.paste(t, (x,0)); x += 128
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out_path)
+
+
+# Device selection
+def get_device_and_amp():
+    dml_device = None
+    try:
+        import torch_directml
+        dml_device = torch_directml.device()
+    except Exception:
+        dml_device = None
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        use_amp = bool(CONFIG["AMP"])  
+    elif dml_device is not None:
+        device = dml_device           
+        use_amp = False               
+    else:
+        device = torch.device("cpu")
+        use_amp = False
+    return device, use_amp
+
+
+def main():
+    set_seed(CONFIG["SEED"])
+    ensure_outdir(CONFIG["OUT_DIR"])
+
+    root = Path(CONFIG["DATA_ROOT"])
+    # Require protocol files
+    proto = ["gt_index.txt","jk_index.txt","name_query.txt","name_test.txt"]
+    if not all((root/fn).exists() for fn in proto):
+        raise RuntimeError("VeRi protocol files not found in DATA_ROOT.")
+
+    device, use_amp = get_device_and_amp()
+    tqdm.write(f"device: {device}")
+
+    tr = root / "image_train"; qu = root / "image_query"; ga = root / "image_test"
+    tr_paths_all = list_images(tr); q_paths = list_images(qu); g_paths = list_images(ga)
+    if CONFIG["USE_CAMERA_HOLDOUT"]:
+        tr_paths, _ = camera_split_train(tr_paths_all, CONFIG["HOLDOUT_CAM"])
+    else:
+        tr_paths = tr_paths_all
+
+    train_all = build_items(tr_paths, max_per_id=CONFIG.get("MAX_PER_ID_TRAIN", None))
+    tr_split, va_split = split_train_val_by_images_per_id(train_all, val_frac=0.1, seed=CONFIG["SEED"])
+    train_ids = sorted({vid for _, vid in tr_split})
+
+    in_ch = 3 if USE_RGB else 1
+    train_ds = VeRiDataset(tr_split, size=tuple(CONFIG["IMG_SIZE"]), use_rgb=USE_RGB, map_ids=train_ids, augment=True)
+    val_ds   = VeRiDataset(va_split, size=tuple(CONFIG["IMG_SIZE"]), use_rgb=USE_RGB, map_ids=train_ids, augment=False)
+    query_ds = VeRiDataset(build_items(q_paths), size=tuple(CONFIG["IMG_SIZE"]), use_rgb=USE_RGB, map_ids=None, augment=False)
+    gallery_ds = VeRiDataset(build_items(g_paths), size=tuple(CONFIG["IMG_SIZE"]), use_rgb=USE_RGB, map_ids=None, augment=False)
+
+    model = TinyCNN(in_ch=in_ch, emb_dim=CONFIG["EMB_DIM"], n_classes=len(train_ids)).to(device)
+    opt = optim.AdamW(model.parameters(), lr=CONFIG["LR"], weight_decay=CONFIG["WEIGHT_DECAY"])
+    crit = nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)  
+
+    train_loader = DataLoader(train_ds, batch_size=CONFIG["BATCH_SIZE"], shuffle=True,  num_workers=0, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=CONFIG["BATCH_SIZE"], shuffle=False, num_workers=0, pin_memory=True)
+    q_loader     = DataLoader(query_ds, batch_size=CONFIG["BATCH_SIZE"], shuffle=False, num_workers=0, pin_memory=True)
+    g_loader     = DataLoader(gallery_ds,batch_size=CONFIG["BATCH_SIZE"], shuffle=False, num_workers=0, pin_memory=True)
+
+    # Train
+    history = {"train_loss": [], "val_acc": []}
+    best_val = 0.0
+    for ep in range(1, CONFIG["EPOCHS"]+1):
+        model.train(); losses = []
+        for x, y, _, _ in tqdm(train_loader, desc=f"train ep{ep}", unit="batch"):
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits = model(x); loss = crit(logits, y)
+            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+            losses.append(loss.item())
+        model.eval(); correct = 0; total = 0
+        with torch.no_grad():
+            for x, y, _, _ in tqdm(val_loader, desc="val", unit="batch"):
+                x, y = x.to(device), y.to(device)
+                pred = model(x).argmax(1); correct += (pred==y).sum().item(); total += y.numel()
+        val_acc = correct / max(1, total)
+        history["train_loss"].append(float(np.mean(losses))); history["val_acc"].append(val_acc)
+        tqdm.write(f"[epoch {ep}] train_loss={history['train_loss'][-1]:.4f}  val_acc={val_acc:.3f}")
+        if val_acc > best_val and SAVE_CKPT:
+            torch.save({"model":model.state_dict(),
+                        "config":{"in_ch":in_ch,"emb_dim":CONFIG["EMB_DIM"],"n_classes":len(train_ids)}},
+                       SAVE_CKPT)
+            best_val = val_acc; tqdm.write(f"saved checkpoint -> {SAVE_CKPT}")
+
+    plot_learning_curves(history, Path(CONFIG["OUT_DIR"]) / "learning_curve_cnn.png")
+
+    # Calibration on validation
+    confs, corr = [], []
+    model.eval()
+    with torch.no_grad():
+        for x, y, *_ in val_loader:
+            x, y = x.to(device), y.to(device)
+            p = torch.softmax(model(x), dim=1)
+            mc, pred = p.max(1)
+            confs.extend(mc.cpu().numpy().tolist())
+            corr.extend((pred==y).cpu().numpy().astype(np.int32).tolist())
+    plot_reliability(confs, corr, Path(CONFIG["OUT_DIR"])/"cnn_calibration.png", "CNN Calibration")
+
+    # Embeddings
+    q_emb, q_vids, q_names = embed_loader(model, q_loader, device)
+    g_emb, g_vids, g_names = embed_loader(model, g_loader, device)
+
+    # Protocol alignment
+    q_ref, g_ref, gt_map, jk_map = load_veri_eval_lists(root)
+    pos_q = {n:i for i,n in enumerate(q_names)}
+    pos_g = {n:i for i,n in enumerate(g_names)}
+    q_idx = np.array([pos_q[n] for n in q_ref], dtype=np.int64)
+    g_idx = np.array([pos_g[n] for n in g_ref], dtype=np.int64)
+
+    # Evaluate (VeRi protocol) with per-query details
+    topk = (1,5,10)
+    metrics, ap_list, cmc_ind, prec_at_k, order = eval_veri(
+        q_emb[q_idx], q_ref, g_emb[g_idx], g_ref, gt_map, jk_map, topk=topk
+    )
+
+    
+    alpha = 1.0 - CONFIG["CI"]/100.0
+    ci = bootstrap(
+        np.array(ap_list), cmc_ind, prec_at_k,
+        n_boot=CONFIG["BOOT_N"], alpha=alpha, seed=CONFIG["SEED"], topk=topk
+    )
+    metrics.update(ci)
+    metrics["val_acc_best"] = float(best_val)
+
+
+    save_json(OUT_JSON, {
+        "config": CONFIG,
+        "results": metrics,
+        "timestamp": timestamp(),
+        "device": str(device)
+    })
+    tqdm.write(f"saved -> {OUT_JSON}")
+    tqdm.write("done.")
+
+if __name__ == "__main__":
+    main()

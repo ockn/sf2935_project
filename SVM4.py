@@ -1,23 +1,7 @@
-# Fast VeRi SVM baselines with tqdm + VeRi protocol (protocol-only evaluator)
-# Outputs:
-#   - veri_results_fast.json
-#   - outputs/svm_calibration.png
-#
-# Baselines:
-#   - PCA-only retrieval
-#   - Linear SVM surrogate (SGD hinge)
-#   - Optional RBF approximation via Random Fourier Features
-#
-# Now includes:
-#   - 95% CIs for mAP AND CMC@{1,5,10} (bootstrap over queries)
-#   - Precision@{1,5,10} per query (+ CIs) and FP@k = 1 - Precision@k
-#   - Overall Correct@1 (== CMC@1) and FP@1
-#
-# Requires in DATA_ROOT:
-#   image_train/, image_query/, image_test/
-#   gt_index.txt, jk_index.txt, name_query.txt, name_test.txt
-
-import os, json, time, random
+#KTH SF2935
+#Name: Cecil Knudsen
+#SVM for Vehicle re-id 
+import json, time, random
 from pathlib import Path
 from typing import List, Tuple, Dict
 import numpy as np
@@ -31,22 +15,21 @@ from sklearn.kernel_approximation import RBFSampler
 from sklearn.calibration import calibration_curve
 import matplotlib.pyplot as plt
 
-# -----------------------
-# CONFIG (shared shape with CNN.py)
-# -----------------------
+
+# CONFIG
 CONFIG = {
     "DATA_ROOT": r"C:\Users\cecil\Documents\dataset\archive\VeRi",
-    "IMG_SIZE":  [128, 128],   # (H, W) for SVM image loading
+    "IMG_SIZE":  [128, 128],   # (H, W) 
     "SEED": 42,
     "OUT_DIR": "outputs",
-    "USE_CAMERA_HOLDOUT": False,   # diagnostic only (no impact on retrieval eval)
+    "USE_CAMERA_HOLDOUT": False,   
     "HOLDOUT_CAM": "c002",
 
     # Bootstrap
     "BOOT_N": 1000,
     "CI": 95,
 
-    # SVM/PCA knobs
+    # SVM/PCA  settings
     "SVM_USE_RGB": True,        # True = RGB pixels (flattened 3*H*W), False = grayscale
     "PCA_DIM": 96,
     "MAX_PER_ID_TRAIN": None,   # None = ALL training images
@@ -62,9 +45,8 @@ CONFIG = {
 OUT_FILE = "veri_svm_results.json"
 BATCH_DECISION = 4096
 
-# -----------------------
+
 # Helpers
-# -----------------------
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -116,10 +98,8 @@ def load_veri_eval_lists(root: Path):
         jk_map[i] = {g_names[j] for j in idxs if 0 <= j < len(g_names)}
     return q_names, g_names, gt_map, jk_map
 
-# -----------------------
-# Evaluation (VeRi protocol)
-# -----------------------
-def cmc_map_verbose(q_emb, q_names, g_emb, g_names, gt_map, jk_map, topk=(1,5,10)):
+# Evaluation
+def cmc_map(q_emb, q_names, g_emb, g_names, gt_map, jk_map, topk=(1,5,10)):
     """
     VeRi protocol evaluator:
       - removes junk (same-camera etc.)
@@ -150,13 +130,12 @@ def cmc_map_verbose(q_emb, q_names, g_emb, g_names, gt_map, jk_map, topk=(1,5,10
         keep = ~junk
         good_kept = good[keep]  # boolean vector aligned to kept ranks
 
-        # CMC indicators (first correct within k)
+        # CMC indicators
         if good_kept.any():
             first_pos = int(np.argmax(good_kept))
             for kidx, k in enumerate(topk):
                 cmc_ind[qi, kidx] = 1.0 if first_pos < k else 0.0
 
-        # AP for this query
         if good_kept.sum() == 0:
             ap_per_q[qi] = 0.0
         else:
@@ -168,7 +147,7 @@ def cmc_map_verbose(q_emb, q_names, g_emb, g_names, gt_map, jk_map, topk=(1,5,10
                     precisions.append(hits / r)
             ap_per_q[qi] = float(np.mean(precisions))
 
-        # Precision@k and FP@k
+
         for kidx, k in enumerate(topk):
             topk_slice = good_kept[:k]
             if topk_slice.size == 0:
@@ -176,7 +155,7 @@ def cmc_map_verbose(q_emb, q_names, g_emb, g_names, gt_map, jk_map, topk=(1,5,10
             else:
                 prec_at_k[qi, kidx] = float(topk_slice.mean())  # fraction of true among first k
 
-    # Means (point estimates)
+    # Means
     metrics = {
         "mAP": float(ap_per_q.mean()),
         **{f"CMC@{k}": float(cmc_ind[:, idx].mean()) for idx, k in enumerate(topk)},
@@ -187,7 +166,7 @@ def cmc_map_verbose(q_emb, q_names, g_emb, g_names, gt_map, jk_map, topk=(1,5,10
     }
     return metrics, ap_per_q, cmc_ind, prec_at_k
 
-def bootstrap_ci_multi(ap_per_q: np.ndarray,
+def bootstrap(ap_per_q: np.ndarray,
                        cmc_ind: np.ndarray,
                        prec_at_k: np.ndarray,
                        n_boot: int,
@@ -219,14 +198,14 @@ def bootstrap_ci_multi(ap_per_q: np.ndarray,
         out[f"CMC@{[1,5,10,15,20][:K][i]}_CI"] = (float(low[1+i]), float(high[1+i]))
     for i in range(K):
         out[f"Precision@{[1,5,10,15,20][:K][i]}_CI"] = (float(low[1+K+i]), float(high[1+K+i]))
+        
         # FP@k CI is 1 - Precision@k → invert the interval endpoints
         lo_p, hi_p = low[1+K+i], high[1+K+i]
         out[f"FP@{[1,5,10,15,20][:K][i]}_CI"] = (float(1.0 - hi_p), float(1.0 - lo_p))
     return out
 
-# -----------------------
+
 # Pipeline (data + features)
-# -----------------------
 def load_split(data_root: Path):
     tr = data_root / "image_train"
     qu = data_root / "image_query"
@@ -239,9 +218,9 @@ def load_and_resize(path: str, size, use_rgb: bool) -> np.ndarray:
     img = img.resize(size, Image.BILINEAR)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     if use_rgb:
-        return arr.reshape(-1)           # H x W x 3 -> 3HW
+        return arr.reshape(-1)         
     else:
-        return arr.flatten()             # H x W -> HW
+        return arr.flatten()             
 
 def build_matrix(paths: List[Path], size=(112,112), max_per_id=None, stage="", use_rgb=False):
     by_id: Dict[str, List[Path]] = {}
@@ -289,9 +268,8 @@ def rbf_approx_embeddings(Xtr, ytr, Xq, Xg, n_comp, gamma):
     tqdm.write(f"RFF done {time.time()-t0:.1f}s (Ztr={Ztr.shape})")
     return sgd_linear_embeddings(Ztr, ytr, Zq, Zg)
 
-# -----------------------
-# Calibration plot (diagnostic)
-# -----------------------
+
+# Calibration plot 
 def plot_reliability(confs, correct, out_path: Path, title="Calibration"):
     prob_true, prob_pred = calibration_curve(correct, confs, n_bins=10, strategy="uniform")
     plt.figure()
@@ -301,9 +279,7 @@ def plot_reliability(confs, correct, out_path: Path, title="Calibration"):
     plt.title(title); plt.tight_layout()
     plt.savefig(out_path, dpi=200); plt.close()
 
-# -----------------------
-# Main
-# -----------------------
+
 def main():
     set_seed(CONFIG["SEED"])
     ensure_outdir(CONFIG["OUT_DIR"])
@@ -331,7 +307,7 @@ def main():
     Xg_px,  yg, gn   = build_matrix(g_paths, size=tuple(CONFIG["IMG_SIZE"]), stage="gallery",
                                     use_rgb=use_rgb)
 
-    # Scale + PCA (fit on train)
+    # Scale + PCA
     scaler = StandardScaler(with_mean=True, with_std=True)
     Xtr_s = scaler.fit_transform(Xtr_px)
     Xq_s  = scaler.transform(Xq_px)
@@ -343,7 +319,7 @@ def main():
     pca = PCA(n_components=n_comp, svd_solver="randomized", whiten=True, random_state=CONFIG["SEED"])
     Xtr = pca.fit_transform(Xtr_s); Xq = pca.transform(Xq_s); Xg = pca.transform(Xg_s)
 
-    # -------- Calibration (closed-set diagnostic) --------
+    #Calibration
     try:
         rng = np.random.RandomState(CONFIG["SEED"])
         by_id = {}
@@ -361,10 +337,10 @@ def main():
         )
         clf_log.fit(Xtr[tr_idx], ytr[tr_idx])
 
-        prob = clf_log.predict_proba(Xtr[va_idx])         # [Nval, C]
-        conf = prob.max(axis=1)                            # confidence
-        pred_idx = prob.argmax(axis=1)                     # class indices
-        pred_labels = clf_log.classes_[pred_idx]           # map indices -> label strings
+        prob = clf_log.predict_proba(Xtr[va_idx])       
+        conf = prob.max(axis=1)                      
+        pred_idx = prob.argmax(axis=1)                    
+        pred_labels = clf_log.classes_[pred_idx]           
         corr = (pred_labels == ytr[va_idx]).astype(np.int32)
 
         plot_reliability(conf, corr,
@@ -373,7 +349,7 @@ def main():
     except Exception as e:
         tqdm.write(f"Calibration skipped: {e}")
 
-    # Protocol alignment
+    
     q_ref, g_ref, gt_map, jk_map = load_veri_eval_lists(root)
     pos_q = {n:i for i,n in enumerate(qn)}
     pos_g = {n:i for i,n in enumerate(gn)}
@@ -385,10 +361,10 @@ def main():
 
     # PCA-only
     if CONFIG["RUN_PCA_ONLY"]:
-        res_pca, ap_pca, cmc_pca, prec_pca = cmc_map_verbose(
+        res_pca, ap_pca, cmc_pca, prec_pca = cmc_map(
             Xq[q_idx], q_ref, Xg[g_idx], g_ref, gt_map, jk_map
         )
-        ci_pca = bootstrap_ci_multi(np.array(ap_pca), cmc_pca, prec_pca,
+        ci_pca = bootstrap(np.array(ap_pca), cmc_pca, prec_pca,
                                     n_boot=CONFIG["BOOT_N"], alpha=alpha, seed=CONFIG["SEED"])
         res_pca["mAP_CI95"]   = list(ci_pca["mAP_CI"])
         res_pca["CMC@1_CI95"] = list(ci_pca["CMC@1_CI"])
@@ -406,10 +382,10 @@ def main():
     # Linear SVM
     if CONFIG["RUN_LINEAR_SGD"]:
         q_lin, g_lin = sgd_linear_embeddings(Xtr, ytr, Xq, Xg)
-        res_lin, ap_lin, cmc_lin, prec_lin = cmc_map_verbose(
+        res_lin, ap_lin, cmc_lin, prec_lin = cmc_map(
             q_lin[q_idx], q_ref, g_lin[g_idx], g_ref, gt_map, jk_map
         )
-        ci_lin = bootstrap_ci_multi(np.array(ap_lin), cmc_lin, prec_lin,
+        ci_lin = bootstrap(np.array(ap_lin), cmc_lin, prec_lin,
                                     n_boot=CONFIG["BOOT_N"], alpha=alpha, seed=CONFIG["SEED"])
         res_lin["mAP_CI95"]   = list(ci_lin["mAP_CI"])
         res_lin["CMC@1_CI95"] = list(ci_lin["CMC@1_CI"])
@@ -428,10 +404,10 @@ def main():
     if CONFIG["RUN_RBF_APPROX"]:
         gamma = (1.0 / CONFIG["PCA_DIM"]) if (CONFIG["RFF_GAMMA"] is None) else CONFIG["RFF_GAMMA"]
         q_rbf, g_rbf = rbf_approx_embeddings(Xtr, ytr, Xq, Xg, CONFIG["RFF_COMPONENTS"], gamma)
-        res_rbf, ap_rbf, cmc_rbf, prec_rbf = cmc_map_verbose(
+        res_rbf, ap_rbf, cmc_rbf, prec_rbf = cmc_map(
             q_rbf[q_idx], q_ref, g_rbf[g_idx], g_ref, gt_map, jk_map
         )
-        ci_rbf = bootstrap_ci_multi(np.array(ap_rbf), cmc_rbf, prec_rbf,
+        ci_rbf = bootstrap(np.array(ap_rbf), cmc_rbf, prec_rbf,
                                     n_boot=CONFIG["BOOT_N"], alpha=alpha, seed=CONFIG["SEED"])
         res_rbf["mAP_CI95"]   = list(ci_rbf["mAP_CI"])
         res_rbf["CMC@1_CI95"] = list(ci_rbf["CMC@1_CI"])
